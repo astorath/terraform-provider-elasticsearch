@@ -49,6 +49,7 @@ type ProviderConf struct {
 	awsProfile         string
 	certPemPath        string
 	keyPemPath         string
+	kibanaUrl          string
 }
 
 func Provider() terraform.ResourceProvider {
@@ -59,6 +60,12 @@ func Provider() terraform.ResourceProvider {
 				Required:    true,
 				DefaultFunc: schema.EnvDefaultFunc("ELASTICSEARCH_URL", nil),
 				Description: "Elasticsearch URL",
+			},
+			"kibana_url": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("KIBANA_URL", nil),
+				Description: "URL to reach the Kibana API",
 			},
 			"sniff": {
 				Type:        schema.TypeBool,
@@ -108,42 +115,36 @@ func Provider() terraform.ResourceProvider {
 				Default:     "",
 				Description: "The access key for use with AWS Elasticsearch Service domains",
 			},
-
 			"aws_secret_key": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Default:     "",
 				Description: "The secret key for use with AWS Elasticsearch Service domains",
 			},
-
 			"aws_token": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Default:     "",
 				Description: "The session token for use with AWS Elasticsearch Service domains",
 			},
-
 			"aws_profile": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Default:     "",
 				Description: "The AWS profile for use with AWS Elasticsearch Service domains",
 			},
-
 			"aws_region": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Default:     "",
 				Description: "The AWS region for use in signing of AWS elasticsearch requests. Must be specified in order to use AWS URL signing with AWS ElasticSearch endpoint exposed on a custom DNS domain.",
 			},
-
 			"cacert_file": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Default:     "",
 				Description: "A Custom CA certificate",
 			},
-
 			"insecure": {
 				Type:        schema.TypeBool,
 				Optional:    true,
@@ -185,6 +186,7 @@ func Provider() terraform.ResourceProvider {
 			"elasticsearch_index_template":                  resourceElasticsearchIndexTemplate(),
 			"elasticsearch_composable_index_template":       resourceElasticsearchComposableIndexTemplate(),
 			"elasticsearch_ingest_pipeline":                 resourceElasticsearchIngestPipeline(),
+			"elasticsearch_kibana_alert":                    resourceElasticsearchKibanaAlert(),
 			"elasticsearch_kibana_object":                   resourceElasticsearchKibanaObject(),
 			"elasticsearch_monitor":                         resourceElasticsearchDeprecatedMonitor(),
 			"elasticsearch_snapshot_repository":             resourceElasticsearchSnapshotRepository(),
@@ -225,6 +227,7 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 
 	return &ProviderConf{
 		rawUrl:          rawUrl,
+		kibanaUrl:       d.Get("kibana_url").(string),
 		insecure:        d.Get("insecure").(bool),
 		sniffing:        d.Get("sniff").(bool),
 		healthchecking:  d.Get("healthcheck").(bool),
@@ -247,6 +250,7 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 		keyPemPath:         d.Get("client_key_path").(string),
 	}, nil
 }
+
 func getClient(conf *ProviderConf) (interface{}, error) {
 	opts := []elastic7.ClientOptionFunc{
 		elastic7.SetURL(conf.rawUrl),
@@ -362,6 +366,57 @@ func getClient(conf *ProviderConf) (interface{}, error) {
 	}
 
 	return relevantClient, nil
+}
+
+func getKibanaClient(conf *ProviderConf) (interface{}, error) {
+	// use either the provided version of elasticsearch or the version of
+	// elasticsearch determined by pinging the cluster. Base AWS or other auth
+	// off of the same ES config
+	esClient, err := getClient(conf)
+	if err != nil {
+		return nil, err
+	}
+
+	switch esClient.(type) {
+	case *elastic7.Client:
+		opts := []elastic7.ClientOptionFunc{
+			elastic7.SetURL(conf.kibanaUrl),
+			elastic7.SetScheme(conf.parsedUrl.Scheme),
+			// kibana api does not support sniff/healtheck
+			elastic7.SetSniff(false),
+			elastic7.SetHealthcheck(false),
+		}
+
+		if conf.parsedUrl.User.Username() != "" {
+			p, _ := conf.parsedUrl.User.Password()
+			opts = append(opts, elastic7.SetBasicAuth(conf.parsedUrl.User.Username(), p))
+		}
+		if conf.username != "" && conf.password != "" {
+			opts = append(opts, elastic7.SetBasicAuth(conf.username, conf.password))
+		}
+
+		if m := awsUrlRegexp.FindStringSubmatch(conf.parsedUrl.Hostname()); m != nil && conf.signAWSRequests {
+			log.Printf("[INFO] Using AWS: %+v", m[1])
+			opts = append(opts, elastic7.SetHttpClient(awsHttpClient(m[1], conf)), elastic7.SetSniff(false))
+		} else if awsRegion := conf.awsRegion; conf.awsRegion != "" && conf.signAWSRequests {
+			log.Printf("[INFO] Using AWS: %+v", awsRegion)
+			opts = append(opts, elastic7.SetHttpClient(awsHttpClient(awsRegion, conf)), elastic7.SetSniff(false))
+		} else if conf.insecure || conf.cacertFile != "" {
+			opts = append(opts, elastic7.SetHttpClient(tlsHttpClient(conf)))
+		} else if conf.token != "" {
+			opts = append(opts, elastic7.SetHttpClient(tokenHttpClient(conf.token, conf.tokenName, conf.insecure)), elastic7.SetSniff(false))
+		}
+
+		// rt := WithHeader(client.Transport)
+		// rt.Set("kbn-xsrf", "true")
+		// client.Transport = rt
+
+		return elastic7.NewClient(opts...)
+	case *elastic6.Client:
+		return nil, errors.New("ElasticSearch is older than 6.0.0!")
+	default:
+		return nil, errors.New("ElasticSearch is older than 5.0.0!")
+	}
 }
 
 func assumeRoleCredentials(region, roleARN string) *awscredentials.Credentials {
