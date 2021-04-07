@@ -16,6 +16,8 @@ import (
 	elastic7 "github.com/olivere/elastic/v7"
 	elastic5 "gopkg.in/olivere/elastic.v5"
 	elastic6 "gopkg.in/olivere/elastic.v6"
+
+	"github.com/phillbaker/terraform-provider-elasticsearch/kibana"
 )
 
 var (
@@ -553,4 +555,8 @@ func elastic7GetVersion(client *elastic7.Client) (*version.Version, error) {
 		return nil, err
 	}
 	return version.NewVersion(versionString)
+}
+
+func expandKibanaActionsList(resourcesArray []interface{}) ([]kibana.AlertAction, error) {
+	return []kibana.AlertAction{}, nil
 }
