@@ -373,6 +373,7 @@ func assumeRoleCredentials(region, roleARN string) *awscredentials.Credentials {
 		Client:  stsClient,
 		RoleARN: roleARN,
 	}
+	// AddDebugHandlers
 
 	return awscredentials.NewChainCredentials([]awscredentials.Provider{assumeRoleProvider})
 }
@@ -410,7 +411,10 @@ func awsSession(region string, conf *ProviderConf) *awssession.Session {
 
 func awsHttpClient(region string, conf *ProviderConf) *http.Client {
 	signer := awssigv4.NewSigner(awsSession(region, conf).Config.Credentials)
-	client, _ := aws_signing_client.New(signer, nil, "es", region)
+	client, err := aws_signing_client.New(signer, nil, "es", region)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	return client
 }
