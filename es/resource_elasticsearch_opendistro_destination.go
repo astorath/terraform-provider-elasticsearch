@@ -79,7 +79,7 @@ func resourceElasticsearchOpenDistroDestinationCreate(d *schema.ResourceData, m 
 }
 
 func resourceElasticsearchOpenDistroDestinationRead(d *schema.ResourceData, m interface{}) error {
-	res, err := resourceElasticsearchOpenDistroGetDestination(d.Id(), m)
+	destination, err := resourceElasticsearchOpenDistroGetDestination(d.Id(), m)
 
 	if elastic6.IsNotFound(err) || elastic7.IsNotFound(err) {
 		log.Printf("[WARN] Destination (%s) not found, removing from state", d.Id())
@@ -91,7 +91,12 @@ func resourceElasticsearchOpenDistroDestinationRead(d *schema.ResourceData, m in
 		return err
 	}
 
-	err = d.Set("body", res)
+	body, err := json.Marshal(destination)
+	if err != nil {
+		return err
+	}
+
+	err = d.Set("body", string(body))
 	return err
 }
 
@@ -137,39 +142,84 @@ func resourceElasticsearchOpenDistroDestinationDelete(d *schema.ResourceData, m 
 	return err
 }
 
-func resourceElasticsearchOpenDistroGetDestination(destinationID string, m interface{}) (string, error) {
-	var err error
-	response := new(destinationResponse)
-
-	// See https://github.com/opendistro-for-elasticsearch/alerting/issues/56, no API endpoint for retrieving destination
-	var body *json.RawMessage
+func resourceElasticsearchOpenDistroGetDestination(destinationID string, m interface{}) (Destination, error) {
 	esClient, err := getClient(m.(*ProviderConf))
 	if err != nil {
-		return "", err
+		return Destination{}, err
 	}
+
+	var dr destinationResponse
 	switch client := esClient.(type) {
 	case *elastic7.Client:
-		body, err = elastic7GetObject(client, DESTINATION_INDEX, destinationID)
+		// See https://github.com/opendistro-for-elasticsearch/alerting/issues/56,
+		// no API endpoint for retrieving destination prior to ODFE 1.11.0. So do
+		// a request, if it 404s, fall back to trying to query the index.
+		path, err := uritemplates.Expand("/_opendistro/_alerting/destinations/{id}", map[string]string{
+			"id": destinationID,
+		})
+		if err != nil {
+			return Destination{}, fmt.Errorf("error building URL path for destination: %+v", err)
+		}
+
+		httpResponse, err := client.PerformRequest(context.TODO(), elastic7.PerformRequestOptions{
+			Method: "GET",
+			Path:   path,
+		})
+		if err == nil {
+			var drg destinationResponseGet
+			if err := json.Unmarshal(httpResponse.Body, &drg); err != nil {
+				return Destination{}, fmt.Errorf("error unmarshalling destination body: %+v", err)
+			}
+			// The response structure from the API is the same for the index and get
+			// endpoints :|, and different from the other endpoints. Normalize the
+			// response here.
+			log.Printf("[INFO] destination response: %+v", drg)
+			// // 2021/04/24 21:52:50 [INFO] destination response:
+			// // map[destinations:[map[id:_XXeBXkBWX0T7YR5-vLZ
+			// // last_update_time:1.619301169875e+12 name:my-destination
+			// // primary_term:1 schema_version:3 seq_no:1
+			// // slack:map[url:http://www.example.com] type:slack
+			// // user:map[backend_roles:[admin] custom_attribute_names:[] name:admin
+			// // roles:[all_access own_index]]]] totalDestinations:1]
+			// destinations := m["destinations"].([]interface{})
+			// var d Destination
+			// if err := json.Unmarshal(destinations[0], &d); err != nil {
+			// 	return "", fmt.Errorf("error unmarshalling destination body: %+v", err)
+			// }
+			// m["destination"] = d
+			// m["_id"] = m
+			// body, err = json.Marshal(m)
+			// if err != nil {
+			// 	return "", err
+			// }
+			if len(drg.Destinations) > 0 {
+				return drg.Destinations[0], nil
+			} else {
+				return Destination{}, fmt.Errorf("endpoint returned empty set of destinations: %+v", drg)
+			}
+		} else {
+			body, err := elastic7GetObject(client, DESTINATION_INDEX, destinationID)
+
+			if err != nil {
+				return Destination{}, err
+			}
+			if err := json.Unmarshal(*body, &dr); err != nil {
+				return Destination{}, fmt.Errorf("error unmarshalling destination body: %+v: %+v", err, body)
+			}
+			return dr.Destination, nil
+		}
 	case *elastic6.Client:
-		body, err = elastic6GetObject(client, DESTINATION_TYPE, DESTINATION_INDEX, destinationID)
+		body, err := elastic6GetObject(client, DESTINATION_TYPE, DESTINATION_INDEX, destinationID)
+		if err != nil {
+			return Destination{}, err
+		}
+		if err := json.Unmarshal(*body, &dr); err != nil {
+			return Destination{}, fmt.Errorf("error unmarshalling destination body: %+v: %+v", err, body)
+		}
+		return dr.Destination, nil
 	default:
-		err = errors.New("destination resource not implemented prior to Elastic v6")
+		return Destination{}, errors.New("destination resource not implemented prior to Elastic v6")
 	}
-
-	if err != nil {
-		return "", err
-	}
-
-	if err := json.Unmarshal(*body, response); err != nil {
-		return "", fmt.Errorf("error unmarshalling destination body: %+v: %+v", err, body)
-	}
-
-	tj, err := json.Marshal(response.Destination)
-	if err != nil {
-		return "", err
-	}
-
-	return string(tj), err
 }
 
 func resourceElasticsearchOpenDistroPostDestination(d *schema.ResourceData, m interface{}) (*destinationResponse, error) {
@@ -270,5 +320,22 @@ func resourceElasticsearchOpenDistroPutDestination(d *schema.ResourceData, m int
 type destinationResponse struct {
 	Version     int         `json:"_version"`
 	ID          string      `json:"_id"`
-	Destination interface{} `json:"destination"`
+	Destination Destination `json:"destination"`
+}
+
+// When this api endpoint was introduced after the other endpoints, it has a
+// different response structure
+type destinationResponseGet struct {
+	Destinations []Destination `json:"destinations"`
+}
+
+type Destination struct {
+	ID            string      `json:"id"`
+	Type          string      `json:"type"`
+	Name          string      `json:"name"`
+	Slack         interface{} `json:"slack,omitempty"`
+	CustomWebhook interface{} `json:"custom_webhook,omitempty"`
+	Chime         interface{} `json:"chime,omitempty"`
+	SNS           interface{} `json:"sns,omitempty"`
+	Email         interface{} `json:"email,omitempty"`
 }
